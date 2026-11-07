@@ -27,8 +27,8 @@ export const TURN_SCHEMA = {
       type: 'OBJECT',
       nullable: true,
       properties: {
-        wrong: { type: 'STRING', description: 'Całe zdanie ucznia.' },
-        right: { type: 'STRING', description: 'Całe poprawne zdanie.' },
+        wrong: { type: 'STRING', description: 'Cała wypowiedź ucznia, dosłownie.' },
+        right: { type: 'STRING', description: 'Cała wypowiedź ucznia po poprawieniu, nie sam fragment.' },
         pl: { type: 'STRING', description: 'Polskie znaczenie poprawnego zdania, w formie męskiej.' },
         why: { type: 'STRING', description: 'Powód po polsku, do 10 słów.' },
         category: { type: 'STRING', description: 'Krótka nazwa typu błędu, np. was/were, -ed, nieregularne, did, przedimki, szyk, słownictwo, wymowa.' },
@@ -54,6 +54,7 @@ export const TURN_SCHEMA = {
         answer_lang: { type: 'STRING', enum: ['en', 'pl'] },
         options: { type: 'ARRAY', items: STR },
         expected: { type: 'STRING', description: 'Przy repeat: całe zdanie do powtórzenia.' },
+        source_pl: { type: 'STRING', description: 'Przy translate: polskie zdanie, które uczeń ma sam przetłumaczyć.' },
       },
       required: ['type', 'answer_lang'],
     },
@@ -147,7 +148,7 @@ Jesteś ciepła, cierpliwa, masz lekkie poczucie humoru, ale jesteś wymagająca
 ZASADY KAŻDEJ WIADOMOŚCI
 1. Najwyżej 2-3 krótkie zdania, razem do 35 słów.
 2. Dokładnie jedno zadanie naraz, potem czekasz na odpowiedź.
-3. Aktywne przypominanie: uczeń ma sam tworzyć. Nie podawaj odpowiedzi przed jego próbą. Gdy nie wie, daj podpowiedź, na przykład pierwsze słowo, a dopiero potem całą odpowiedź.
+3. Aktywne przypominanie: uczeń ma sam tworzyć. Nie podawaj odpowiedzi przed jego próbą. Gdy nie wie, daj podpowiedź, na przykład pierwsze słowo, a dopiero potem całą odpowiedź. Przy zadaniu translate w say jest TYLKO polskie zdanie, nigdy jego angielska wersja, a to samo polskie zdanie wpisz do task.source_pl. Dobrze: say pl „Przetłumacz: Wczoraj byłem zmęczony.”, zadanie translate. Źle: say pl „Przetłumacz:” i en „I was tired yesterday.”. Angielskie zdanie wolno podać tylko przy zadaniu repeat albo listen.
 4. Błąd: wypełnij correction (całe zdanie ucznia, całe poprawne, krótki powód po polsku) i daj zadanie repeat, w którym uczeń powtarza CAŁE poprawne zdanie. Poprawne zdanie ma być też w say po angielsku. Nie idź dalej, dopóki nie powtórzy dobrze. Po dwóch nieudanych próbach idź dalej i wróć do tego później.
 5. W jednej wiadomości poprawiaj tylko jeden, najważniejszy błąd.
 6. Rozpoznawanie mowy: wiadomości z oznaczeniem [mikrofon] przeszły przez automatyczne rozpoznawanie mowy i mogą być przekręcone. Pomijaj interpunkcję, wielkie litery i słowa, które brzmią podobnie do poprawnych. Oceniaj gramatykę, a nie jakość rozpoznawania. Gdy tekst nie ma sensu, daj verdict unclear i poproś spokojnie o powtórzenie, bez poprawiania go.
@@ -257,6 +258,23 @@ export function parseTurn(raw) {
   };
   if (task.type === 'choice' && task.options.length < 2) task.type = 'speak';
   if (task.type !== 'choice') task.options = [];
+
+  // Twarda zasada: przy tłumaczeniu uczeń nie widzi i nie słyszy gotowej odpowiedzi.
+  if (task.type === 'translate' && say.some((s) => s.lang === 'en')) {
+    const source = cleanSpoken(t.source_pl);
+    const english = say.filter((s) => s.lang === 'en').map((s) => s.text).join(' ');
+    const polish = say.filter((s) => s.lang === 'pl');
+    if (source) {
+      say.length = 0;
+      say.push(...polish);
+      if (!polish.some((s) => s.text.includes(source))) say.push({ lang: 'pl', text: source, hidden: false });
+    } else {
+      // Bez polskiego zdania nie ma czego tłumaczyć, więc to jest powtarzanie.
+      task.type = 'repeat';
+      task.expected = english;
+      task.answer_lang = 'en';
+    }
+  }
 
   const verdict = ['ok', 'error', 'unclear', 'none'].includes(data.verdict) ? data.verdict : 'none';
   const c = data.correction;

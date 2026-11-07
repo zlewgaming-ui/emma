@@ -1,5 +1,5 @@
 // Tryb offline: aplikacja startuje bez internetu, powtórki działają. Przy każdej zmianie plików podbij numer.
-const VERSION = 'emma-3e3617cbd2';
+const VERSION = 'emma-80388606d1';
 const FONT_CACHE = 'emma-fonts';
 const FILES = [
   './',
