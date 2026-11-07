@@ -27,6 +27,7 @@ export class Lesson {
     this.listener = () => {};
     this.paused = true;
     this.busy = false;
+    this.busySince = 0;
     this.hold = false;
     this.finished = false;
     this.failed = null;
@@ -134,6 +135,8 @@ export class Lesson {
     const dt = Math.min((now - this.lastTick) / 1000, 2);
     this.lastTick = now;
     if (this.paused || this.hold || this.finished) return;
+    // Dłuższe czekanie na odpowiedź Google nie zabiera czasu lekcji.
+    if (this.busy && now - this.busySince > 3000) return;
     this.s.elapsed += dt;
     const phase = phaseAt(this.s.elapsed);
     if (phase.id !== this.s.phaseId) this.enterPhase(phase);
@@ -213,6 +216,7 @@ export class Lesson {
 
   async request() {
     this.busy = true;
+    this.busySince = performance.now();
     this.failed = null;
     this.emit('busy', true);
     this.ctrl = new AbortController();
@@ -226,7 +230,7 @@ export class Lesson {
           contents: this.contents(),
           schema: TURN_SCHEMA,
           signal,
-          timeoutMs: this.pendingAudio ? 60000 : 45000,
+          timeoutMs: this.pendingAudio ? 25000 : 12000,
           onWait: (sec) => {
             this.hold = true;
             this.emit('wait', sec);
@@ -346,7 +350,7 @@ export class Lesson {
         const contents = list.map((m) => ({ role: m.role, parts: [{ text: m.text }] }));
         contents.push({ role: 'user', parts: [{ text: '[aplikacja] Lekcja zakończona. Zwróć raport.' }] });
         const out = await generate({
-          system: buildFinalPrompt(store, s), contents, schema: FINAL_SCHEMA, temperature: 0.4, maxTokens: 1500, timeoutMs: 40000,
+          system: buildFinalPrompt(store, s), contents, schema: FINAL_SCHEMA, temperature: 0.4, maxTokens: 1500, timeoutMs: 20000,
         });
         final = parseFinal(out.text);
       } catch (err) {

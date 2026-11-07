@@ -41,6 +41,7 @@ export function renderLesson(root, nav, params = {}) {
   const unit = unitById(s.unit);
   let answerLang = (s.task && s.task.answer_lang) || 'en';
   let waitNote = '';
+  let slowTimer = null;
   let confirmingEnd = false;
   let ended = false;
 
@@ -366,9 +367,15 @@ export function renderLesson(root, nav, params = {}) {
         renderDock();
         break;
       case 'busy':
+        clearTimeout(slowTimer);
         if (payload) {
           waitNote = '';
           setError('');
+          slowTimer = setTimeout(() => {
+            if (!lesson.busy) return;
+            waitNote = 'Google ma teraz duży ruch. Zegar stoi, Emma zaraz odpowie.';
+            renderTurns();
+          }, 5000);
         }
         renderTurns();
         renderDock();

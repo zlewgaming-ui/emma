@@ -6,7 +6,9 @@ import { safeGet, safeSet, sleep } from './util.js';
 const BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 // Lista zapasowa, gdy nie uda się pobrać listy modeli. Stan z listopada 2026.
-const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-3.6-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'];
+const FALLBACK_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash'];
+// Model, który nie odpowiedział na czas, odpoczywa, żeby kolejne wiadomości na niego nie czekały.
+const SLOW_MODEL_COOLDOWN = 10 * 60 * 1000;
 const COOLDOWN_KEY = 'emma.modelCooldown';
 const NO_THINKING_KEY = 'emma.modelNoThinking';
 
@@ -37,7 +39,8 @@ export function clearCooldowns() {
   safeSet(COOLDOWN_KEY, '{}');
 }
 
-// Najnowszy Flash jako główny, potem starsze, na końcu Flash-Lite.
+// W rozmowie liczy się szybkość. Najpierw Flash-Lite, który odpowiada w około sekundę,
+// a większe modele Flash są zapasem, bo w godzinach szczytu potrafią wisieć minutami.
 export function rankModels(names) {
   const parsed = [];
   for (const raw of names) {
@@ -48,7 +51,7 @@ export function rankModels(names) {
   parsed.sort((a, b) => (Number(a.lite) - Number(b.lite)) || (b.version - a.version));
   const flash = parsed.filter((p) => !p.lite).slice(0, 2);
   const lite = parsed.filter((p) => p.lite).slice(0, 2);
-  return [...flash, ...lite].map((p) => p.name);
+  return [...lite, ...flash].map((p) => p.name);
 }
 
 function describeNetworkError() {
@@ -79,7 +82,8 @@ export async function checkKey(key) {
 }
 
 function modelChain() {
-  return store.settings.models && store.settings.models.length ? store.settings.models : FALLBACK_MODELS;
+  const saved = store.settings.models && store.settings.models.length ? rankModels(store.settings.models) : [];
+  return saved.length ? saved : FALLBACK_MODELS;
 }
 
 function parseQuota(body) {
@@ -152,7 +156,7 @@ async function callModel(model, key, params, timeoutMs, signal) {
 
 // Wysyła zapytanie, a gdy model ma limit, przechodzi na kolejny.
 export async function generate({
-  system, contents, schema, temperature = 0.7, maxTokens = 2048, timeoutMs = 45000, signal, onWait,
+  system, contents, schema, temperature = 0.7, maxTokens = 2048, timeoutMs = 12000, signal, onWait,
 }) {
   const key = store.apiKey;
   if (!key) throw new GeminiError('auth', 'Brak klucza Gemini. Wklej go w ustawieniach.');
@@ -173,8 +177,13 @@ export async function generate({
         result = await callModel(model, key, params, timeoutMs, signal);
       } catch (err) {
         if (signal && signal.aborted) throw err;
-        lastError = describeNetworkError();
-        continue;
+        if (err && err.name === 'AbortError') {
+          setCooldown(model, SLOW_MODEL_COOLDOWN);
+          lastError = new GeminiError('bad', 'Google ma teraz duży ruch i nie odpowiedział na czas.');
+          continue;
+        }
+        // Brak internetu nie zależy od modelu, więc nie ma na co czekać.
+        throw describeNetworkError();
       }
       const { status, body } = result;
       const message = (body.error && body.error.message) || '';
@@ -255,7 +264,7 @@ export async function transcribe({ base64, mimeType, lang }) {
     }],
     temperature: 0,
     maxTokens: 400,
-    timeoutMs: 60000,
+    timeoutMs: 25000,
   });
   return out.text.trim();
 }
