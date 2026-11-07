@@ -230,7 +230,7 @@ export class Lesson {
           contents: this.contents(),
           schema: TURN_SCHEMA,
           signal,
-          timeoutMs: this.pendingAudio ? 25000 : 12000,
+          timeoutMs: this.pendingAudio ? 25000 : 10000,
           onWait: (sec) => {
             this.hold = true;
             this.emit('wait', sec);

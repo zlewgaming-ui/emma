@@ -7,9 +7,10 @@ const BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 // Lista zapasowa, gdy nie uda się pobrać listy modeli. Stan z listopada 2026.
 const FALLBACK_MODELS = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.6-flash'];
-// Model, który nie odpowiedział na czas, odpoczywa, żeby kolejne wiadomości na niego nie czekały.
-const SLOW_MODEL_COOLDOWN = 10 * 60 * 1000;
-const COOLDOWN_KEY = 'emma.modelCooldown';
+// Większy model, który nie odpowiedział na czas, odpoczywa, bo potrafi wisieć minutami.
+// Flash-Lite nie odpoczywa: jego milczenie to zwykle chwilowa przerwa w sieci.
+const SLOW_REST_BIG = 10 * 60 * 1000;
+const COOLDOWN_KEY = 'emma.modelRest';
 const NO_THINKING_KEY = 'emma.modelNoThinking';
 
 export class GeminiError extends Error {
@@ -24,19 +25,33 @@ function readJsonMap(key) {
   try { return JSON.parse(safeGet(key) || '{}'); } catch { return {}; }
 }
 
-function setCooldown(model, ms) {
+// why: slow (nie odpowiedział), error (chwilowy błąd), minute (limit na minutę),
+// day (limit na dziś), gone (model niedostępny na tym kluczu).
+function setCooldown(model, ms, why) {
   const map = readJsonMap(COOLDOWN_KEY);
-  map[model] = Date.now() + ms;
+  map[model] = { until: Date.now() + ms, why };
   safeSet(COOLDOWN_KEY, JSON.stringify(map));
 }
 
-function cooldownLeft(model) {
-  const until = readJsonMap(COOLDOWN_KEY)[model] || 0;
-  return Math.max(0, until - Date.now());
+function restOf(model) {
+  const rest = readJsonMap(COOLDOWN_KEY)[model];
+  if (!rest || rest.until <= Date.now()) return null;
+  return { left: rest.until - Date.now(), why: rest.why };
 }
 
 export function clearCooldowns() {
   safeSet(COOLDOWN_KEY, '{}');
+}
+
+// Wszystkie modele odpoczywają po chwilowych kłopotach, a uczeń czeka: próbujemy od nowa.
+function forgiveTemporaryRests(chain) {
+  if (chain.some((model) => !restOf(model))) return;
+  const map = readJsonMap(COOLDOWN_KEY);
+  for (const model of chain) {
+    const rest = map[model];
+    if (rest && (rest.why === 'slow' || rest.why === 'error')) delete map[model];
+  }
+  safeSet(COOLDOWN_KEY, JSON.stringify(map));
 }
 
 // W rozmowie liczy się szybkość. Najpierw Flash-Lite, który odpowiada w około sekundę,
@@ -156,20 +171,22 @@ async function callModel(model, key, params, timeoutMs, signal) {
 
 // Wysyła zapytanie, a gdy model ma limit, przechodzi na kolejny.
 export async function generate({
-  system, contents, schema, temperature = 0.7, maxTokens = 2048, timeoutMs = 12000, signal, onWait,
+  system, contents, schema, temperature = 0.7, maxTokens = 2048, timeoutMs = 10000, signal, onWait,
 }) {
   const key = store.apiKey;
   if (!key) throw new GeminiError('auth', 'Brak klucza Gemini. Wklej go w ustawieniach.');
   const params = { system, contents, schema, temperature, maxTokens };
+  const chain = modelChain();
   let lastError = null;
+  forgiveTemporaryRests(chain);
 
   for (let round = 0; round < 2; round += 1) {
-    let shortestWait = Infinity;
-    let dailyLimit = false;
-    for (const model of modelChain()) {
-      const left = cooldownLeft(model);
-      if (left > 0) {
-        shortestWait = Math.min(shortestWait, left);
+    let minuteWait = Infinity;
+    let timeouts = 0;
+    for (const model of chain) {
+      const rest = restOf(model);
+      if (rest) {
+        if (rest.why === 'minute') minuteWait = Math.min(minuteWait, rest.left);
         continue;
       }
       let result;
@@ -178,8 +195,11 @@ export async function generate({
       } catch (err) {
         if (signal && signal.aborted) throw err;
         if (err && err.name === 'AbortError') {
-          setCooldown(model, SLOW_MODEL_COOLDOWN);
-          lastError = new GeminiError('bad', 'Google ma teraz duży ruch i nie odpowiedział na czas.');
+          if (!/-lite$/.test(model)) setCooldown(model, SLOW_REST_BIG, 'slow');
+          lastError = new GeminiError('bad', 'Google nie odpowiedział na czas. Spróbuj ponownie.');
+          // Dwa modele z rzędu milczą: to raczej sieć, więc nie każemy czekać na kolejne.
+          timeouts += 1;
+          if (timeouts >= 2) break;
           continue;
         }
         // Brak internetu nie zależy od modelu, więc nie ma na co czekać.
@@ -212,39 +232,42 @@ export async function generate({
       }
       if (status === 429) {
         const q = parseQuota(body);
-        if (q.noFreeTier) setCooldown(model, 7 * 86400000);
-        else if (q.perDay) {
-          setCooldown(model, 6 * 3600000);
-          dailyLimit = true;
-        } else {
-          setCooldown(model, q.retryMs);
-          shortestWait = Math.min(shortestWait, q.retryMs);
+        if (q.noFreeTier) setCooldown(model, 7 * 86400000, 'gone');
+        else if (q.perDay) setCooldown(model, 6 * 3600000, 'day');
+        else {
+          setCooldown(model, q.retryMs, 'minute');
+          minuteWait = Math.min(minuteWait, q.retryMs);
         }
         lastError = new GeminiError('quota', 'Limit darmowych zapytań.');
         continue;
       }
       if (status === 404) {
-        setCooldown(model, 7 * 86400000);
+        setCooldown(model, 7 * 86400000, 'gone');
         lastError = new GeminiError('bad', `Model ${model} nie jest dostępny.`);
         continue;
       }
       // Przeciążenie albo inny błąd modelu: próbujemy następnego.
-      setCooldown(model, status === 400 ? 3600000 : 20000);
+      setCooldown(model, status === 400 ? 3600000 : 20000, 'error');
       lastError = new GeminiError('bad', `Google zwrócił błąd ${status}. ${message}`.trim());
     }
 
     // Żaden model nie odpowiedział. Jeśli limit na minutę zaraz minie, czekamy.
-    if (round === 0 && shortestWait !== Infinity && shortestWait <= 70000) {
-      if (onWait) onWait(Math.ceil(shortestWait / 1000));
-      await sleep(shortestWait + 300);
+    if (round === 0 && minuteWait <= 70000) {
+      if (onWait) onWait(Math.ceil(minuteWait / 1000));
+      await sleep(minuteWait + 300);
       if (signal && signal.aborted) throw new GeminiError('network', 'Przerwano.');
       continue;
     }
-    if (dailyLimit || shortestWait !== Infinity) {
-      const daily = dailyLimit || shortestWait > 600000;
-      throw new GeminiError('quota', daily
-        ? 'Darmowy limit Gemini na dziś się skończył. Odnawia się około 9:00 rano polskiego czasu. Powtórki bez Emmy działają nadal.'
-        : 'Limit zapytań na minutę jeszcze trwa. Spróbuj ponownie za chwilę.', { daily });
+    if (minuteWait !== Infinity) {
+      throw new GeminiError('quota', 'Limit zapytań na minutę jeszcze trwa. Spróbuj ponownie za chwilę.', { daily: false });
+    }
+    // O końcu dziennego limitu mówimy tylko wtedy, gdy naprawdę nie ma już żadnego modelu.
+    const exhausted = chain.every((model) => {
+      const rest = restOf(model);
+      return rest && (rest.why === 'day' || rest.why === 'gone');
+    });
+    if (exhausted) {
+      throw new GeminiError('quota', 'Darmowy limit Gemini na dziś się skończył. Odnawia się około 9:00 rano polskiego czasu. Powtórki bez Emmy działają nadal.', { daily: true });
     }
     break;
   }
