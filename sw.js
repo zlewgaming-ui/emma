@@ -1,5 +1,5 @@
 // Tryb offline: aplikacja startuje bez internetu, powtórki działają. Przy każdej zmianie plików podbij numer.
-const VERSION = 'emma-80388606d1';
+const VERSION = 'emma-f67e73a7b0';
 const FONT_CACHE = 'emma-fonts';
 const FILES = [
   './',
@@ -26,7 +26,9 @@ const FILES = [
 ];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(VERSION).then((c) => c.addAll(FILES)).then(() => self.skipWaiting()));
+  // cache: 'reload' omija pamięć przeglądarki, inaczej nowa wersja mogłaby zapisać stare pliki.
+  const fresh = FILES.map((file) => new Request(file, { cache: 'reload' }));
+  event.waitUntil(caches.open(VERSION).then((c) => c.addAll(fresh)).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', (event) => {
